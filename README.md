@@ -10,8 +10,8 @@ Fielddesk is a React dashboard backed by Supabase for running a small business f
 - Department and team performance surface
 - Inventory watchlist with stock severity
 - Sales performance and daily sales summary
-- Supabase persistence for workspace data, site-admin business accounts, registration requests, and platform settings
-- Online/offline detection with pending-sync feedback
+- Supabase persistence for workspace data, business registrations, and platform settings
+- Online/offline connection status and cached workspace viewing when a connection drops
 
 ## Run locally
 
@@ -25,10 +25,30 @@ npm run dev
 
 1. Create a Supabase project.
 2. Open the Supabase SQL editor and run [`supabase.sql`](supabase.sql).
-3. Copy [`.env.example`](.env.example) to `.env.local` and fill in the project URL and anon key. These variables are required; the app persists all business data in Supabase and operates online-only. No browser storage or offline synchronization is used.
+3. Copy [`.env.example`](.env.example) to `.env.local` and fill in the project URL and anon key. These variables are required. Supabase remains the source of truth; the app can show a previously loaded workspace from this device during a connection outage, but sign-in and saving changes still require a connection.
 4. Restart Vite with `npm run dev`.
 
-The SQL migration enables tenant RLS and requires an authenticated Supabase user with a row in `public.tenant_memberships`. Provision each business owner or worker in Supabase Auth using the app's login email convention `<username>@biztrack.app`, then insert their `(user_id, tenant_id, role)` membership using a trusted admin process. Do not grant clients insert or update access to that table. Platform administrators must have `app_metadata.role = platform_admin`.
+The SQL enables tenant RLS and requires an authenticated Supabase user with a row in `public.tenant_memberships`. Business owners and workers sign in with their username and password; the app resolves each valid pair to a tenant-specific Auth identity and claims membership for that tenant. If Supabase email confirmation is enabled, username-based accounts cannot complete their first sign-in because generated `@biztrack.app` addresses cannot receive confirmation mail. Do not grant clients insert or update access to `public.tenant_memberships`.
+
+Platform administrators must be provisioned as Supabase Auth users by a trusted operator, with `app_metadata.role` set to `platform_admin`. The app intentionally has no default admin credentials or public admin-registration flow; `user_metadata` is not an authorization source. Create and confirm the Auth user first. For a username that is not an email, use the app's generated email convention; for example, `muli@track12` maps to `u-6d756c6940747261636b3132@biztrack.app`. In the Supabase SQL editor, set the trusted claim for that exact Auth user:
+
+```sql
+update auth.users
+set raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || '{"role":"platform_admin"}'::jsonb
+where email = 'u-6d756c6940747261636b3132@biztrack.app';
+```
+
+Verify one row was updated, then sign out and sign in again so the new claim is present in the Auth token. For an existing project, apply [`202609260002_secure_auth_boundaries.sql`](supabase/migrations/202609260002_secure_auth_boundaries.sql) before deploying this frontend. It hashes legacy plaintext account passwords, removes the obsolete site-admin password table and public password-based biometric RPCs, and restricts platform settings to platform-admin Auth claims. Then apply [`202610050001_tenant_scoped_usernames.sql`](supabase/migrations/202610050001_tenant_scoped_usernames.sql) before deploying the matching frontend. It allows the same username across businesses while requiring a different password for each account using that username. Tenant-specific Auth identities are created on first login. Fresh projects should run `supabase.sql` and then this migration.
+
+After applying the SQL migration, the app uses the public anon key and direct Supabase auth + database access only. No Edge Functions are required for workspace login or worker provisioning. Workspace settings are saved through an owner-only RPC; payment-method settings are applied to the sales form immediately.
+
+For existing projects, also apply [`202611020001_allow_password_reset_before_first_auth_login.sql`](supabase/migrations/202611020001_allow_password_reset_before_first_auth_login.sql). It lets site admins reset a business owner or worker password before that account has created its first Supabase Auth login, and synchronizes the Auth password when one already exists.
+
+Then apply [`202611020003_confirm_auth_login_on_admin_reset.sql`](supabase/migrations/202611020003_confirm_auth_login_on_admin_reset.sql). A site-admin reset now confirms an existing generated BizTrack Auth login as well as synchronizing its password, so a pending email-confirmation state cannot block that reset account from signing in.
+
+Apply [`202611020002_explain_login_identity_mismatches.sql`](supabase/migrations/202611020002_explain_login_identity_mismatches.sql) to distinguish a wrong username/password from a username/password pair shared by multiple accounts. The sign-in page now reports lookup failures separately instead of disguising them as invalid credentials.
+
+Apply [`202611020004_login_resolution_performance.sql`](supabase/migrations/202611020004_login_resolution_performance.sql) to index account usernames and account-bearing workspace members and avoid repeating bcrypt comparisons during sign-in. The app also avoids unnecessary local password hashing and only attempts first-login account creation when Supabase reports invalid credentials, not on network or service errors.
 
 The browser uses the public anon key only. Do not put a Supabase service-role key in this app. Biometric data is WebAuthn credential metadata only: credential IDs and verification proofs are stored in the non-exposed `private_biometrics` schema and accessed through tenant-checked RPCs. Raw biometric templates or fingerprint/face images are never stored.
 
@@ -55,3 +75,5 @@ npx vercel alias <deployment-url> Biztrack1.vercel.app
 ```
 
 Add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` to the Vercel project environment variables for Production, then redeploy. The existing [`vercel.json`](vercel.json) keeps client-side routes working on refresh.
+
+To enable the owner AI assistant, add `GEMINI_API_KEY` (recommended) or `OPENAI_API_KEY` as a server-side Production environment variable in Vercel, then redeploy. Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/apikey). Enter only the key value; do not use a `VITE_` prefix or include the variable name in the value. The key must not be added to client-side code.

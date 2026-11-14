@@ -29,21 +29,15 @@ create table if not exists public.registration_requests (
   plan text
 );
 
-create table if not exists public.site_admin_accounts (
-  id integer primary key default 1 check (id = 1),
-  name text not null,
-  username text not null,
-  password text not null,
-  business text not null default 'Biz Track HQ'
-);
-
 create table if not exists public.platform_settings (
   id integer primary key default 1 check (id = 1),
   platform_name text not null default 'BizTrack',
   support_email text not null default 'support@biztrack.app',
   whatsapp_number text not null default '',
   default_plan text not null default 'Starter' check (default_plan in ('Starter', 'Growth', 'Scale')),
-  maintenance_mode boolean not null default false
+  maintenance_mode boolean not null default false,
+  maintenance_ends_at timestamptz,
+  public_registration_enabled boolean not null default false
 );
 
 create table if not exists public.workspace_snapshots (
@@ -105,9 +99,46 @@ create table if not exists public.site_admin_snapshots (
   updated_at timestamptz not null default now()
 );
 
+create or replace function public.get_public_registration_packages()
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  with package_source as (
+    select coalesce(
+      (select payload -> 'packages' from public.site_admin_snapshots where id = 1),
+      '[
+        {"name":"Starter","price":29,"seats":5,"duration":1,"durationUnit":"month","description":"For a small team getting started.","features":["Sales and revenue tracking","Team and permissions"],"active":true},
+        {"name":"Growth","price":79,"seats":12,"duration":1,"durationUnit":"month","description":"For growing businesses and teams.","features":["Sales and revenue tracking","Team and permissions","Attendance and payroll","Inventory and stock"],"active":true},
+        {"name":"Scale","price":149,"seats":30,"duration":1,"durationUnit":"month","description":"For larger operations with more seats.","features":["Sales and revenue tracking","Team and permissions","Attendance and payroll","Inventory and stock","Reports and printing","Departments and roles"],"active":true}
+      ]'::jsonb
+    ) as packages
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'name', package.value ->> 'name',
+    'price', coalesce(package.value -> 'price', '0'::jsonb),
+    'seats', coalesce(package.value -> 'seats', '1'::jsonb),
+    'duration', coalesce(package.value -> 'duration', '1'::jsonb),
+    'durationUnit', coalesce(package.value ->> 'durationUnit', 'month'),
+    'description', coalesce(package.value ->> 'description', ''),
+    'features', case when jsonb_typeof(package.value -> 'features') = 'array' then package.value -> 'features' else '[]'::jsonb end,
+    'active', true
+  ) order by package.ordinality), '[]'::jsonb)
+  from package_source
+  cross join lateral jsonb_array_elements(
+    case when jsonb_typeof(package_source.packages) = 'array' then package_source.packages else '[]'::jsonb end
+  ) with ordinality as package(value, ordinality)
+  where nullif(trim(package.value ->> 'name'), '') is not null
+    and package.value ->> 'active' is distinct from 'false';
+$$;
+
+revoke all on function public.get_public_registration_packages() from public, anon, authenticated;
+grant execute on function public.get_public_registration_packages() to anon, authenticated;
+
 alter table public.business_accounts enable row level security;
 alter table public.registration_requests enable row level security;
-alter table public.site_admin_accounts enable row level security;
 alter table public.platform_settings enable row level security;
 alter table public.workspace_snapshots enable row level security;
 alter table public.workspace_sessions enable row level security;
@@ -117,6 +148,8 @@ alter table public.biometric_proofs enable row level security;
 alter table public.site_admin_snapshots enable row level security;
 
 alter table public.platform_settings add column if not exists whatsapp_number text not null default '';
+alter table public.platform_settings add column if not exists maintenance_ends_at timestamptz;
+alter table public.platform_settings add column if not exists public_registration_enabled boolean not null default false;
 alter table public.business_accounts drop constraint if exists business_accounts_plan_check;
 alter table public.registration_requests add column if not exists phone text;
 alter table public.registration_requests add column if not exists email text;
@@ -129,7 +162,6 @@ alter table public.platform_settings drop constraint if exists platform_settings
 
 drop policy if exists "Allow anonymous app access to business accounts" on public.business_accounts;
 drop policy if exists "Allow anonymous app access to registration requests" on public.registration_requests;
-drop policy if exists "Allow anonymous app access to site admin account" on public.site_admin_accounts;
 drop policy if exists "Allow anonymous app access to platform settings" on public.platform_settings;
 drop policy if exists "Allow anonymous app access to workspace snapshots" on public.workspace_snapshots;
 drop policy if exists "Allow anonymous app access to workspace sessions" on public.workspace_sessions;
@@ -142,8 +174,6 @@ create policy "Allow anonymous app access to business accounts"
   on public.business_accounts for all to anon using (true) with check (true);
 create policy "Allow anonymous app access to registration requests"
   on public.registration_requests for all to anon using (true) with check (true);
-create policy "Allow anonymous app access to site admin account"
-  on public.site_admin_accounts for all to anon using (true) with check (true);
 create policy "Allow anonymous app access to platform settings"
   on public.platform_settings for all to anon using (true) with check (true);
 create policy "Allow anonymous app access to workspace snapshots"
@@ -156,10 +186,6 @@ create policy "Allow anonymous app access to biometric proofs"
   on public.biometric_proofs for all to anon using (true) with check (true);
 create policy "Allow anonymous app access to site admin snapshots"
   on public.site_admin_snapshots for all to anon using (true) with check (true);
-
-insert into public.site_admin_accounts (id, name, username, password, business)
-values (1, 'Platform admin', 'muli@track12', 'muli@track12', 'Biz Track HQ')
-on conflict (id) do update set username = excluded.username, password = excluded.password;
 
 insert into public.platform_settings (id)
 values (1)
@@ -198,6 +224,8 @@ as $$
 declare
   requested_username text;
   authenticated_email text := lower(coalesce(auth.jwt() ->> 'email', ''));
+  expected_email text;
+  metadata jsonb := coalesce(auth.jwt() -> 'app_metadata', '{}'::jsonb);
 begin
   if auth.uid() is null then
     raise exception 'Authentication required';
@@ -205,7 +233,11 @@ begin
   select lower(username) into requested_username
   from public.business_accounts
   where tenant_id = requested_tenant_id;
-  if requested_username is null or split_part(authenticated_email, '@', 1) <> requested_username then
+  expected_email := case
+    when lower(requested_username) ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$' then lower(requested_username)
+    else 'u-' || encode(convert_to(requested_username, 'UTF8'), 'hex') || '@biztrack.app'
+  end;
+  if requested_username is null or authenticated_email <> expected_email then
     raise exception 'Tenant owner identity does not match';
   end if;
   insert into public.tenant_memberships (user_id, tenant_id, role)
@@ -215,70 +247,8 @@ begin
 end;
 $$;
 
-create or replace function public.register_owner_biometric_legacy(
-  requested_tenant_id text,
-  requested_username text,
-  requested_password text,
-  requested_member_id bigint,
-  requested_member_name text,
-  requested_credential_id text,
-  requested_registered_at timestamptz
-)
-returns void
-language plpgsql
-security definer
-set search_path = public, private_biometrics
-as $$
-declare
-  owner_password text;
-begin
-  select password into owner_password
-  from public.business_accounts
-  where tenant_id = requested_tenant_id
-    and lower(username) = lower(requested_username);
-  if owner_password is null or owner_password <> requested_password then
-    raise exception 'Owner verification failed';
-  end if;
-  if exists (select 1 from private_biometrics.credentials where tenant_id = requested_tenant_id and member_id = requested_member_id) then
-    raise exception 'This worker already has a biometric in this business';
-  end if;
-  insert into private_biometrics.credentials (tenant_id, member_id, member_name, credential_id, subject_identifier, registered_at)
-  values (requested_tenant_id, requested_member_id, requested_member_name, requested_credential_id, requested_credential_id, requested_registered_at);
-exception when unique_violation then
-  raise exception 'This biometric is already registered in this business';
-end;
-$$;
-
-create or replace function public.list_owner_biometric_credentials(
-  requested_tenant_id text,
-  requested_username text,
-  requested_password text
-)
-returns table (credential_id text)
-language plpgsql
-security definer
-set search_path = public, private_biometrics
-as $$
-declare
-  owner_password text;
-begin
-  select password into owner_password
-  from public.business_accounts
-  where tenant_id = requested_tenant_id
-    and lower(username) = lower(requested_username);
-  if owner_password is null or owner_password <> requested_password then
-    raise exception 'Owner verification failed';
-  end if;
-  return query
-    select credentials.credential_id
-    from private_biometrics.credentials
-    where credentials.tenant_id = requested_tenant_id;
-end;
-$$;
-
 drop policy if exists "Allow anonymous app access to business accounts" on public.business_accounts;
 drop policy if exists "Allow anonymous app access to registration requests" on public.registration_requests;
-drop policy if exists "Allow anonymous app access to site admin account" on public.site_admin_accounts;
 drop policy if exists "Allow anonymous app access to platform settings" on public.platform_settings;
 drop policy if exists "Allow anonymous app access to workspace snapshots" on public.workspace_snapshots;
 drop policy if exists "Allow anonymous app access to workspace sessions" on public.workspace_sessions;
@@ -291,7 +261,6 @@ drop policy if exists "Members can read their business account" on public.busine
 drop policy if exists "Platform admins manage business accounts" on public.business_accounts;
 drop policy if exists "Anyone can submit a registration request" on public.registration_requests;
 drop policy if exists "Platform admins manage registration requests" on public.registration_requests;
-drop policy if exists "Platform admins manage site admin account" on public.site_admin_accounts;
 drop policy if exists "Platform admins manage platform settings" on public.platform_settings;
 drop policy if exists "Members access their workspace snapshot" on public.workspace_snapshots;
 drop policy if exists "Members access their workspace session" on public.workspace_sessions;
@@ -300,13 +269,17 @@ drop policy if exists "Platform admins manage site snapshots" on public.site_adm
 create policy "Users can read their tenant memberships" on public.tenant_memberships for select to authenticated using (user_id = auth.uid());
 create policy "Members can read their business account" on public.business_accounts for select to authenticated using (public.has_tenant_access(tenant_id));
 create policy "Platform admins manage business accounts" on public.business_accounts for all to authenticated using (public.is_platform_admin()) with check (public.is_platform_admin());
-create policy "Anyone can submit a registration request" on public.registration_requests for insert to anon, authenticated with check (true);
+create policy "Anyone can submit a registration request" on public.registration_requests for insert to anon, authenticated with check (password is null or password ~ '^\$2[aby]\$[0-9]{2}\$');
 create policy "Platform admins manage registration requests" on public.registration_requests for all to authenticated using (public.is_platform_admin()) with check (public.is_platform_admin());
-create policy "Platform admins manage site admin account" on public.site_admin_accounts for all to authenticated using (public.is_platform_admin()) with check (public.is_platform_admin());
 create policy "Platform admins manage platform settings" on public.platform_settings for all to authenticated using (public.is_platform_admin()) with check (public.is_platform_admin());
 create policy "Members access their workspace snapshot" on public.workspace_snapshots for all to authenticated using (public.has_tenant_access(tenant_id)) with check (public.has_tenant_access(tenant_id));
 create policy "Members access their workspace session" on public.workspace_sessions for all to authenticated using (public.has_tenant_access(tenant_id)) with check (public.has_tenant_access(tenant_id));
-create policy "Members access their biometric devices" on public.biometric_devices for all to authenticated using (public.has_tenant_access(tenant_id)) with check (public.has_tenant_access(tenant_id));
+drop policy if exists "Members can read their biometric devices" on public.biometric_devices;
+drop policy if exists "Owners manage their biometric devices" on public.biometric_devices;
+create policy "Members can read their biometric devices" on public.biometric_devices for select to authenticated using (public.has_tenant_access(tenant_id));
+create policy "Owners manage their biometric devices" on public.biometric_devices for all to authenticated
+  using (exists (select 1 from public.tenant_memberships where user_id = auth.uid() and tenant_id = biometric_devices.tenant_id and role = 'owner'))
+  with check (exists (select 1 from public.tenant_memberships where user_id = auth.uid() and tenant_id = biometric_devices.tenant_id and role = 'owner'));
 create policy "Platform admins manage site snapshots" on public.site_admin_snapshots for all to authenticated using (public.is_platform_admin()) with check (public.is_platform_admin());
 
 -- Platform identity and maintenance status are public, but only the site-admin
@@ -314,42 +287,266 @@ create policy "Platform admins manage site snapshots" on public.site_admin_snaps
 drop policy if exists "Anyone can read platform settings" on public.platform_settings;
 create policy "Anyone can read platform settings" on public.platform_settings for select to anon, authenticated using (true);
 
-create or replace function public.save_platform_settings(
-  requested_username text,
-  requested_password text,
-  requested_platform_name text,
-  requested_support_email text,
-  requested_whatsapp_number text,
-  requested_default_plan text,
-  requested_maintenance_mode boolean
-)
+drop function if exists public.save_workspace_settings(text, text, text, jsonb);
+
+create or replace function public.save_workspace_settings(requested_tenant_id text, requested_payload jsonb)
 returns void
 language plpgsql
 security definer
 set search_path = public
 as $$
 declare
-  stored_password text;
+  requested_business_name text;
+  requested_username text;
+  expected_owner_email text;
+  authenticated_email text := lower(coalesce(auth.jwt() ->> 'email', ''));
+  metadata jsonb := coalesce(auth.jwt() -> 'app_metadata', '{}'::jsonb);
 begin
-  select password into stored_password
-  from public.site_admin_accounts
-  where id = 1 and lower(username) = lower(trim(requested_username));
-  if stored_password is null or not (stored_password = requested_password or (stored_password like '$2%' and crypt(requested_password, stored_password) = stored_password)) then
-    raise exception 'Site admin verification failed';
+  if auth.uid() is null then
+    raise exception 'Authentication required';
   end if;
-  insert into public.platform_settings (id, platform_name, support_email, whatsapp_number, default_plan, maintenance_mode)
-  values (1, trim(requested_platform_name), trim(requested_support_email), regexp_replace(requested_whatsapp_number, '[^0-9]', '', 'g'), requested_default_plan, requested_maintenance_mode)
+
+  select lower(username) into requested_username
+  from public.business_accounts
+  where tenant_id = requested_tenant_id;
+
+  expected_owner_email := case
+    when lower(requested_username) ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$' then lower(requested_username)
+    else 'u-' || encode(convert_to(requested_username, 'UTF8'), 'hex') || '@biztrack.app'
+  end;
+
+  if requested_username is null
+    or authenticated_email <> expected_owner_email
+    or not exists (
+      select 1 from public.tenant_memberships
+      where user_id = auth.uid() and tenant_id = requested_tenant_id and role = 'owner'
+    ) then
+    raise exception 'Workspace owner identity does not match';
+  end if;
+
+  insert into public.tenant_memberships (user_id, tenant_id, role)
+  values (auth.uid(), requested_tenant_id, 'owner')
+  on conflict (user_id, tenant_id) do update set role = 'owner';
+
+  requested_business_name := nullif(trim(requested_payload ->> 'workspaceName'), '');
+  if requested_business_name is null then
+    raise exception 'Business name cannot be empty';
+  end if;
+
+  update public.business_accounts
+  set business_name = requested_business_name
+  where tenant_id = requested_tenant_id;
+
+  insert into public.workspace_snapshots (tenant_id, payload, updated_at)
+  values (requested_tenant_id, requested_payload, now())
+  on conflict (tenant_id) do update set
+    payload = excluded.payload,
+    updated_at = excluded.updated_at;
+
+  update public.workspace_sessions
+  set workspace_name = requested_business_name, updated_at = now()
+  where tenant_id = requested_tenant_id;
+end;
+$$;
+
+revoke all on function public.save_workspace_settings(text, jsonb) from public, anon;
+grant execute on function public.save_workspace_settings(text, jsonb) to authenticated;
+
+create or replace function public.claim_owner_tenant_by_credentials(requested_username text, requested_password text)
+returns table (
+  id bigint,
+  business_name text,
+  owner_name text,
+  email text,
+  username text,
+  industry text,
+  plan text,
+  status text,
+  seats integer,
+  monthly_price numeric,
+  next_billing date,
+  created_at date,
+  tenant_id text
+)
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  authenticated_email text := lower(coalesce(auth.jwt() ->> 'email', ''));
+  normalized_username text;
+  expected_email text;
+  matching_accounts integer;
+  owner_record public.business_accounts%rowtype;
+begin
+  if auth.uid() is null then
+    raise exception 'Authentication required';
+  end if;
+
+  normalized_username := lower(trim(requested_username));
+  if normalized_username = '' then
+    raise exception 'Username is required';
+  end if;
+
+  if normalized_username ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$' then
+    expected_email := normalized_username;
+  else
+    expected_email := 'u-' || encode(convert_to(normalized_username, 'UTF8'), 'hex') || '@biztrack.app';
+  end if;
+
+  if authenticated_email <> expected_email then
+    raise exception 'Auth identity does not match the owner username';
+  end if;
+
+  select count(*) into matching_accounts
+  from public.business_accounts as account
+  where lower(trim(account.username)) = normalized_username
+    and coalesce(account.password, '') like '$2%'
+    and crypt(requested_password, account.password) = account.password;
+
+  if matching_accounts <> 1 then
+    raise exception 'Owner credentials do not match exactly one business account';
+  end if;
+
+  select account.* into owner_record
+  from public.business_accounts as account
+  where lower(trim(account.username)) = normalized_username
+    and coalesce(account.password, '') like '$2%'
+    and crypt(requested_password, account.password) = account.password
+  limit 1;
+
+  insert into public.tenant_memberships (user_id, tenant_id, role)
+  values (auth.uid(), owner_record.tenant_id, 'owner')
+  on conflict on constraint tenant_memberships_pkey do update set role = 'owner';
+
+  return query
+  select
+    owner_record.id,
+    owner_record.business_name,
+    owner_record.owner_name,
+    owner_record.email,
+    owner_record.username,
+    owner_record.industry,
+    owner_record.plan,
+    owner_record.status,
+    owner_record.seats,
+    owner_record.monthly_price,
+    owner_record.next_billing,
+    owner_record.created_at,
+    owner_record.tenant_id;
+end;
+$$;
+
+revoke all on function public.claim_owner_tenant_by_credentials(text, text) from public, anon;
+grant execute on function public.claim_owner_tenant_by_credentials(text, text) to authenticated;
+
+create or replace function public.claim_member_tenant(requested_username text, requested_password text)
+returns table (tenant_id text, member_id bigint, granted_pages jsonb)
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  expected_email text;
+  authenticated_email text := lower(coalesce(auth.jwt() ->> 'email', ''));
+  matching_accounts integer;
+  claimed_tenant_id text;
+  claimed_member_id bigint;
+  claimed_pages jsonb;
+begin
+  if auth.uid() is null then
+    raise exception 'Authentication required';
+  end if;
+
+  expected_email := case
+    when lower(trim(requested_username)) ~ '^[^@\s]+@[^@\s]+\.[^@\s]+$' then lower(trim(requested_username))
+    else 'u-' || encode(convert_to(lower(trim(requested_username)), 'UTF8'), 'hex') || '@biztrack.app'
+  end;
+  if nullif(trim(requested_username), '') is null or authenticated_email <> expected_email then
+    raise exception 'Invalid username or password';
+  end if;
+
+  select count(*) into matching_accounts
+  from public.workspace_snapshots snapshot
+  cross join lateral jsonb_array_elements(
+    case when jsonb_typeof(snapshot.payload -> 'members') = 'array' then snapshot.payload -> 'members' else '[]'::jsonb end
+  ) member
+  where lower(coalesce(member ->> 'username', '')) = lower(trim(requested_username))
+    and member ->> 'hasAccount' = 'true'
+    and coalesce(member ->> 'password', '') like '$2%'
+    and crypt(requested_password, member ->> 'password') = member ->> 'password'
+    and jsonb_array_length(case
+      when jsonb_typeof(snapshot.payload -> 'accessByMember' -> (member ->> 'id')) = 'array' then snapshot.payload -> 'accessByMember' -> (member ->> 'id')
+      else '[]'::jsonb
+    end) > 0;
+
+  if matching_accounts <> 1 then
+    raise exception 'Invalid credentials, no assigned pages, or duplicate workspace usernames';
+  end if;
+
+  select snapshot.tenant_id, (member ->> 'id')::bigint, snapshot.payload -> 'accessByMember' -> (member ->> 'id')
+  into claimed_tenant_id, claimed_member_id, claimed_pages
+  from public.workspace_snapshots snapshot
+  cross join lateral jsonb_array_elements(
+    case when jsonb_typeof(snapshot.payload -> 'members') = 'array' then snapshot.payload -> 'members' else '[]'::jsonb end
+  ) member
+  where lower(coalesce(member ->> 'username', '')) = lower(trim(requested_username))
+    and member ->> 'hasAccount' = 'true'
+    and coalesce(member ->> 'password', '') like '$2%'
+    and crypt(requested_password, member ->> 'password') = member ->> 'password'
+    and jsonb_array_length(case
+      when jsonb_typeof(snapshot.payload -> 'accessByMember' -> (member ->> 'id')) = 'array' then snapshot.payload -> 'accessByMember' -> (member ->> 'id')
+      else '[]'::jsonb
+    end) > 0;
+
+  insert into public.tenant_memberships (user_id, tenant_id, role)
+  values (auth.uid(), claimed_tenant_id, 'member')
+  on conflict on constraint tenant_memberships_pkey do nothing;
+
+  return query select claimed_tenant_id, claimed_member_id, claimed_pages;
+end;
+$$;
+
+revoke all on function public.claim_member_tenant(text, text) from public, anon;
+grant execute on function public.claim_member_tenant(text, text) to authenticated;
+
+drop function if exists public.save_platform_settings(text, text, text, text, boolean);
+drop function if exists public.save_platform_settings(text, text, text, text, boolean, boolean);
+drop function if exists public.save_platform_settings(text, text, text, text, text, text, boolean);
+
+create or replace function public.save_platform_settings(
+  requested_platform_name text,
+  requested_support_email text,
+  requested_whatsapp_number text,
+  requested_default_plan text,
+  requested_maintenance_mode boolean,
+  requested_maintenance_ends_at timestamptz,
+  requested_public_registration_enabled boolean
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not public.is_platform_admin() then
+    raise exception 'Platform administrator access required';
+  end if;
+  insert into public.platform_settings (id, platform_name, support_email, whatsapp_number, default_plan, maintenance_mode, maintenance_ends_at, public_registration_enabled)
+  values (1, trim(requested_platform_name), trim(requested_support_email), regexp_replace(requested_whatsapp_number, '[^0-9]', '', 'g'), requested_default_plan, requested_maintenance_mode, requested_maintenance_ends_at, requested_public_registration_enabled)
   on conflict (id) do update set
     platform_name = excluded.platform_name,
     support_email = excluded.support_email,
     whatsapp_number = excluded.whatsapp_number,
     default_plan = excluded.default_plan,
-    maintenance_mode = excluded.maintenance_mode;
+    maintenance_mode = excluded.maintenance_mode,
+    maintenance_ends_at = excluded.maintenance_ends_at,
+    public_registration_enabled = excluded.public_registration_enabled;
 end;
 $$;
 
-revoke all on function public.save_platform_settings(text, text, text, text, text, text, boolean) from public;
-grant execute on function public.save_platform_settings(text, text, text, text, text, text, boolean) to anon, authenticated;
+revoke all on function public.save_platform_settings(text, text, text, text, boolean, timestamptz, boolean) from public, anon;
+grant execute on function public.save_platform_settings(text, text, text, text, boolean, timestamptz, boolean) to authenticated;
 
 -- Reader subject identifiers and verification proofs are kept out of the
 -- exposed public schema and out of workspace_snapshots.payload.
@@ -412,7 +609,7 @@ drop table if exists public.biometric_proofs;
 create or replace function public.register_biometric_credential(requested_tenant_id text, requested_member_id bigint, requested_member_name text, requested_credential_id text, requested_registered_at timestamptz)
 returns void language plpgsql security definer set search_path = public, private_biometrics
 as $$ begin
-  if not public.has_tenant_access(requested_tenant_id) then raise exception 'Tenant access denied'; end if;
+  if not exists (select 1 from public.tenant_memberships where user_id = auth.uid() and tenant_id = requested_tenant_id and role = 'owner') then raise exception 'Workspace owner access required'; end if;
   if exists (select 1 from private_biometrics.credentials where tenant_id = requested_tenant_id and member_id = requested_member_id) then
     raise exception 'This worker already has a biometric in this business';
   end if;
@@ -432,38 +629,11 @@ end; $$;
 
 create or replace function public.list_biometric_credentials(requested_tenant_id text)
 returns table (member_id bigint, credential_id text) language sql security definer set search_path = public, private_biometrics
-as $$ select member_id, credential_id from private_biometrics.credentials where tenant_id = requested_tenant_id and public.has_tenant_access(requested_tenant_id); $$;
+as $$ select member_id, credential_id from private_biometrics.credentials where tenant_id = requested_tenant_id and exists (select 1 from public.tenant_memberships where user_id = auth.uid() and tenant_id = requested_tenant_id and role = 'owner'); $$;
 
 create or replace function public.delete_biometric_credential(requested_tenant_id text, requested_member_id bigint, requested_credential_id text)
 returns void language sql security definer set search_path = public, private_biometrics
-as $$ delete from private_biometrics.credentials where tenant_id = requested_tenant_id and member_id = requested_member_id and (requested_credential_id = '' or credential_id = requested_credential_id) and public.has_tenant_access(requested_tenant_id); $$;
-
-create or replace function public.delete_owner_biometric_credential(
-  requested_tenant_id text,
-  requested_username text,
-  requested_password text,
-  requested_member_id bigint
-)
-returns void
-language plpgsql
-security definer
-set search_path = public, private_biometrics
-as $$
-declare
-  owner_password text;
-begin
-  select password into owner_password
-  from public.business_accounts
-  where tenant_id = requested_tenant_id
-    and lower(username) = lower(requested_username);
-  if owner_password is null or owner_password <> requested_password then
-    raise exception 'Owner verification failed';
-  end if;
-  delete from private_biometrics.credentials
-  where tenant_id = requested_tenant_id
-    and member_id = requested_member_id;
-end;
-$$;
+as $$ delete from private_biometrics.credentials where tenant_id = requested_tenant_id and member_id = requested_member_id and (requested_credential_id = '' or credential_id = requested_credential_id) and exists (select 1 from public.tenant_memberships where user_id = auth.uid() and tenant_id = requested_tenant_id and role = 'owner'); $$;
 
 revoke all on function public.register_biometric_credential(text, bigint, text, text, timestamptz) from public, anon;
 revoke all on function public.record_biometric_proof(text, bigint, text, text, timestamptz, date) from public, anon;
@@ -473,11 +643,39 @@ grant execute on function public.register_biometric_credential(text, bigint, tex
 grant execute on function public.record_biometric_proof(text, bigint, text, text, timestamptz, date) to authenticated;
 grant execute on function public.list_biometric_credentials(text) to authenticated;
 grant execute on function public.delete_biometric_credential(text, bigint, text) to authenticated;
-revoke all on function public.delete_owner_biometric_credential(text, text, text, bigint) from public;
-grant execute on function public.delete_owner_biometric_credential(text, text, text, bigint) to anon, authenticated;
 revoke all on function public.claim_owner_tenant(text) from public, anon;
 grant execute on function public.claim_owner_tenant(text) to authenticated;
-revoke all on function public.register_owner_biometric_legacy(text, text, text, bigint, text, text, timestamptz) from public;
-grant execute on function public.register_owner_biometric_legacy(text, text, text, bigint, text, text, timestamptz) to anon, authenticated;
-revoke all on function public.list_owner_biometric_credentials(text, text, text) from public;
-grant execute on function public.list_owner_biometric_credentials(text, text, text) to anon, authenticated;
+
+drop table if exists public.site_admin_accounts;
+
+update public.business_accounts
+set password = crypt(password, gen_salt('bf', 12))
+where password !~ '^\$2[aby]\$[0-9]{2}\$';
+
+update public.registration_requests
+set password = crypt(password, gen_salt('bf', 12))
+where password is not null
+  and password !~ '^\$2[aby]\$[0-9]{2}\$';
+
+update public.workspace_sessions
+set password_hash = crypt(password_hash, gen_salt('bf', 12))
+where password_hash !~ '^\$2[aby]\$[0-9]{2}\$';
+
+update public.workspace_snapshots snapshot
+set payload = jsonb_set(
+  snapshot.payload,
+  '{members}',
+  (
+    select coalesce(jsonb_agg(
+      case
+        when coalesce(member ->> 'password', '') !~ '^\$2[aby]\$[0-9]{2}\$'
+          and coalesce(member ->> 'password', '') <> ''
+        then jsonb_set(member, '{password}', to_jsonb(crypt(member ->> 'password', gen_salt('bf', 12))))
+        else member
+      end
+    ), '[]'::jsonb)
+    from jsonb_array_elements(coalesce(snapshot.payload -> 'members', '[]'::jsonb)) member
+  ),
+  true
+)
+where jsonb_typeof(snapshot.payload -> 'members') = 'array';
